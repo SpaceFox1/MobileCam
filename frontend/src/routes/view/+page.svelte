@@ -1,118 +1,102 @@
 <script lang="ts">
   import { page } from "$app/state";
+  import { Role } from "$lib/interfaces/Role";
+  import Player from "$lib/player.svelte";
+  import { Session, SessionType } from "$lib/protos/common";
+  import { ClientToServer, type ServerToClient } from "$lib/protos/viewer";
+  import { WRTCManager } from "$lib/WebRTCManager";
+  import { WebsocketManager } from "$lib/websocketManager";
+  import { onDestroy, onMount } from "svelte";
 
-  const ICE_CONFIG = {
-    iceServers: [
-      { urls: 'stun:stun.l.google.com:19302' },
-      { urls: 'stun:stun1.l.google.com:19302' },
-    ]
-  };
-
-  let streamer = $derived(page.url.searchParams.get('streamer') || '');
-  let preview: HTMLVideoElement;
-
-  $effect(() => {
-    const wsProtocol = page.url.protocol === 'https:' ? 'wss:' : 'ws:';
-    const internalSocket = new WebSocket(`${wsProtocol}//${page.url.host}/ws?role=viewer&watch_id=${streamer}`);
-    
-    let internalPc: RTCPeerConnection | undefined = undefined;
-    let candidateQueue: RTCIceCandidateInit[] = [];
-
-    internalSocket.addEventListener('error', (err) => console.error("WebSocket Error:", err));
-
-    internalSocket.addEventListener('message', async (event) => {
-      const commandStr: string = event.data.toString();
-      const parts = commandStr.split(":");
-      const command = parts.shift();
-      const params = parts.join(":");
-      
-      switch (command) {
-        case 'f': { // Received Offer
-          const paramsSplit = params.split(":");
-          paramsSplit.shift();
-          const peerConnRemoteDescription = JSON.parse(paramsSplit.join(":").slice(1));
-
-          if (internalPc) internalPc.close();
-
-          internalPc = new RTCPeerConnection(ICE_CONFIG);
-
-          // FIX: Simplified track handling
-          internalPc.ontrack = (e) => {
-            console.log("Track received!", e.track.kind);
-            if (preview.srcObject !== e.streams[0]) {
-              preview.srcObject = e.streams[0];
-              preview.play().catch((err) => console.error("Error playing video:", err));
-            }
-          };
-
-          internalPc.onicecandidate = ({ candidate }) => {
-            if (candidate) internalSocket.send(`h:${streamer}:#${JSON.stringify(candidate)}`);
-          };
-
-          // DIAGNOSTICS: Monitor the connection state
-          internalPc.onconnectionstatechange = () => {
-            if (!internalPc) return;
-            console.log("WebRTC Connection State:", internalPc.connectionState);
-            if (internalPc.connectionState === 'failed') {
-              console.error("WebRTC connection failed. A TURN server might be required.");
-              internalPc.close();
-            }
-          };
-
-          await internalPc.setRemoteDescription(new RTCSessionDescription(peerConnRemoteDescription));
-          
-          const answer = await internalPc.createAnswer();
-          await internalPc.setLocalDescription(answer);
-
-          internalSocket.send(`f:${streamer}:#${JSON.stringify(internalPc.localDescription)}`);
-
-          while (candidateQueue.length > 0) {
-            const queuedCandidate = candidateQueue.shift();
-            if (queuedCandidate) {
-              await internalPc.addIceCandidate(new RTCIceCandidate(queuedCandidate));
-            }
-          }
-          break;
-        }
-
-        case 'g': { // Received ICE Candidate
-          const candidateString = params.split(":");
-          candidateString.shift();
-          const candidate = JSON.parse(candidateString.join(":").slice(1));
-          
-          if (internalPc && internalPc.remoteDescription && internalPc.remoteDescription.type) {
-            await internalPc.addIceCandidate(new RTCIceCandidate(candidate));
-          } else {
-            candidateQueue.push(candidate);
-          }
-          break;
-        }
+  let player: Player;
+  let connectionSession = $state<Session>();
+  let socket = new WebsocketManager(Role.Viewer, commandHandler);
+  const rtcManager = new WRTCManager({
+    onRemoteTrack: (track, streams) => {
+      if (player.getStream() !== streams[0]) {
+        player.setStream(streams[0]);
+        player.setAspectRatio(track.getSettings().aspectRatio ?? 16 / 9);
+        player
+          .play()
+          .catch((err) => console.error("Error playing video:", err));
       }
-    });
+    },
 
-    return () => {
-      internalSocket.close();
-      if (internalPc) internalPc.close();
+    onICECandidate: (conn, candidate) => {
+      const reply = ClientToServer.create();
+      reply.iceCandidate = {
+        candidate: JSON.stringify(candidate),
+        session: conn,
+      };
+      socket.send(ClientToServer.encode(reply).finish());
+    },
+  });
+
+  async function commandHandler(command: ServerToClient) {
+    if (
+      command.updateVideoTransform &&
+      command.updateVideoTransform.videoTransform
+    ) {
+      player.setZoom(
+        Math.max(0, command.updateVideoTransform.videoTransform.zoom),
+      );
+      player.setRotation(command.updateVideoTransform.videoTransform.rotation);
     }
+    if (command.requestRtcAnswer) {
+      connectionSession = {
+        id: command.requestRtcAnswer.streamerId,
+        type: SessionType.SESSION_TYPE_STREAMER,
+      };
+      // create peer connection and send answer back to streamer
+      rtcManager.createPeerConnection(connectionSession);
+      rtcManager.setRemoteDescription(
+        connectionSession,
+        JSON.parse(command.requestRtcAnswer.offer),
+      );
+      const answer = await rtcManager.createStreamAnswer(connectionSession);
+      const reply = ClientToServer.create();
+      reply.rtcAnswerResponse = {
+        streamerId: command.requestRtcAnswer.streamerId,
+        answer: JSON.stringify(answer),
+      };
+      socket.send(ClientToServer.encode(reply).finish());
+    }
+    if (command.iceCandidate && command.iceCandidate.session) {
+      rtcManager.addICECandidate(
+        command.iceCandidate.session,
+        JSON.parse(command.iceCandidate.candidate),
+      );
+    }
+    if (command.disconnectStreamer) {
+      player.getVideo().srcObject = null;
+      rtcManager.closePeerConnection(connectionSession!);
+    }
+    if (command.updateMute) {
+      player.toggleMute(command.updateMute.muted);
+    }
+  }
+
+  onMount(() => {
+    socket.connect({
+      protocol: page.url.protocol,
+      hostname: page.url.host,
+      extraQueries: [["name", page.url.searchParams.get("name")]],
+    });
+  });
+
+  onDestroy(() => {
+    socket.finish();
   });
 </script>
 
-<video id="video" autoplay muted playsinline bind:this={preview}></video>
-
-<style>
-  * {
-    margin: 0;
-    padding: 0;
-    box-sizing: border-box;
-  }
-
-  video {
-    width: 100vw;
-    height: 100vh;
-    position: absolute;
-    top: 0;
-    left: 0;
-    object-fit: cover;
-    background-color: #111; /* Dark background to prove the element is rendering */
-  }
-</style>
+<Player
+  bind:this={player}
+  showOverlay
+  onMuteChange={(state) => {
+    const msg = ClientToServer.create();
+    msg.updateMuteResponse = {
+      muted: state,
+    };
+    socket.send(ClientToServer.encode(msg).finish());
+  }}
+/>

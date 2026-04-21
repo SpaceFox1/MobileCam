@@ -1,84 +1,82 @@
 <script lang="ts">
-  const ICE_CONFIG = {
-    iceServers: [
-      { urls: "stun:stun.l.google.com:19302" },
-      { urls: "stun:stun1.l.google.com:19302" },
-    ],
-  };
+  import { page } from "$app/state";
+  import { Role } from "$lib/interfaces/Role";
+  import { toggleFullScreen } from "$lib/utils/phoneUtils";
+  import { WRTCManager } from "$lib/WebRTCManager";
+  import { WebsocketManager } from "$lib/websocketManager";
+  import { onDestroy } from "svelte";
+  import Camera from "../../lib/camera.svelte";
+  import Screen from "../../lib/screen.svelte";
+  import { ClientToServer, type ServerToClient } from "$lib/protos/streamer";
+  import type { Session } from "$lib/interfaces/session";
 
-  type Quality = "high" | "medium" | "low";
+  // svelte-ignore non_reactive_update
+  let sourceMedia: Camera | Screen;
+  let isCamera = $state(true);
+  let isSocketOpen = $state(false);
+  const socket = new WebsocketManager(Role.Streamer, commandHandler);
+  const rtcManager = new WRTCManager({
+    onICECandidate(session: Session, candidate) {
+      const reply = ClientToServer.create();
+      reply.iceCandidate = {
+        session,
+        candidate: JSON.stringify(candidate),
+      };
+      socket.send(ClientToServer.encode(reply).finish());
+    },
+  });
 
-  const QUALITY_PROFILES = {
-    high: { width: 1920, height: 1080, frameRate: 30, bitrate: 8_000_000 },
-    medium: { width: 1280, height: 720, frameRate: 24, bitrate: 2_000_000 },
-    low: { width: 640, height: 480, frameRate: 15, bitrate: 500_000 },
-  };
-
-  let currentQuality = $state<Quality>("high");
-  let localStream = $state<MediaStream>();
-  let preview: HTMLVideoElement;
-
-  // Hoisted state
-  let peerConnections: Record<string, RTCPeerConnection> = {};
-  let candidateQueues: Record<string, RTCIceCandidateInit[]> = {}; // Queue for the race condition
-  let ws: WebSocket | undefined = undefined;
-
-  let zoomValue = 1;
-  let maxZoom = 5;
-  let minZoom = 1;
-  let nativeZoomSupported = false;
-  let wakeLock: WakeLockSentinel | null = null;
-  const facingMode = "environment"; 
-
-  function applyEncodingParams(quality: Quality, pc: RTCPeerConnection) {
-    if (!pc) return;
-    const q = QUALITY_PROFILES[quality];
-    for (const sender of pc.getSenders()) {
-      if (sender.track?.kind !== "video") continue;
-      const params = sender.getParameters();
-      if (!params.encodings?.length) params.encodings = [{}];
-      params.encodings[0].maxBitrate = q.bitrate;
-      params.encodings[0].maxFramerate = q.frameRate;
-      sender.setParameters(params).catch(() => {});
+  async function setStreamingBandwidth(
+    maxBitrate: number,
+    maxFramerate: number,
+  ) {
+    for await (const pc of rtcManager.getConnections()) {
+      await rtcManager.setStreamBandwidth(
+        WRTCManager.keyToSession(pc),
+        maxBitrate,
+        maxFramerate,
+      );
     }
   }
 
-  async function createPeerConnection(viewerSocketId: string) {
-    if (!localStream) return;
-    if (peerConnections[viewerSocketId]) {
-      peerConnections[viewerSocketId].close();
+  function onCameraTransform(transform: {
+    zoom: number;
+    rotation: number;
+    isNative: boolean;
+  }) {
+    const reply = ClientToServer.create();
+    if (transform.isNative) {
+      const resetVideoTransform = ClientToServer.create();
+      resetVideoTransform.requestVideoTransform = {
+        videoTransform: {
+          zoom: -1,
+          rotation: 0,
+        },
+      };
+      socket.send(ClientToServer.encode(resetVideoTransform).finish());
+      reply.requestZoom = {
+        zoom: transform.zoom,
+      };
+    } else {
+      reply.requestVideoTransform = {
+        videoTransform: {
+          zoom: transform.zoom,
+          rotation: transform.rotation,
+        },
+      };
     }
-    
-    const pc = new RTCPeerConnection(ICE_CONFIG);
-    peerConnections[viewerSocketId] = pc;
-    candidateQueues[viewerSocketId] = []; // Initialize queue for this viewer
+    socket.send(ClientToServer.encode(reply).finish());
+  }
+
+  async function createOffer(session: Session) {
+    const localStream = sourceMedia.getVideoStream();
+    if (!localStream) return;
+    const pc = rtcManager.createPeerConnection(session);
+    if (!pc) return;
 
     for (const track of localStream.getTracks()) {
       pc.addTrack(track, localStream);
     }
-    
-    applyEncodingParams(currentQuality, pc);
-
-    pc.onicecandidate = ({ candidate }) => {
-      if (candidate) {
-        ws?.send(`g:${viewerSocketId}:#${JSON.stringify(candidate)}`);
-      }
-    };
-
-    pc.onconnectionstatechange = () => {
-      if (pc.connectionState !== "failed") return;
-      delete peerConnections[viewerSocketId];
-      delete candidateQueues[viewerSocketId];
-      pc.close();
-    };
-    
-    return pc;
-  }
-
-  async function createOffer(viewerId: string) {
-    if (!localStream) return;
-    const pc = await createPeerConnection(viewerId);
-    if (!pc) return;
 
     const transceivers = pc.getTransceivers();
     const videoTransceiver = transceivers.find(
@@ -98,254 +96,241 @@
       }
     }
 
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-    ws?.send(`f:${viewerId}:#${JSON.stringify(pc.localDescription)}`);
+    const offer = await rtcManager.createStreamOffer(session);
+    const reply = ClientToServer.create();
+    reply.rtcOfferResponse = {
+      session,
+      offer: JSON.stringify(offer),
+    };
+    socket.send(ClientToServer.encode(reply).finish());
   }
 
-  function stringToQuality(string: string): Quality {
-    if (string === "3") return "low";
-    if (string === "2") return "medium";
-    return "high";
+  // @ts-expect-error Chrome-only API
+  function reportBattery(battery: BatteryManager) {
+    const batteryLevel = Math.round(battery.level * 100);
+    const reply = ClientToServer.create();
+    reply.updateBatteryLevel = {
+      batteryLevel,
+    };
+    socket.send(ClientToServer.encode(reply).finish());
   }
 
-  async function applyQuality(quality: Quality) {
-    if (!QUALITY_PROFILES[quality]) return;
-    currentQuality = quality;
-    const q = QUALITY_PROFILES[quality];
+  async function init() {
+    await socket.connect({
+      protocol: page.url.protocol,
+      hostname: page.url.host,
+      extraQueries: [["name", page.url.searchParams.get("name")]],
+    });
+    await sourceMedia.start();
 
-    if (localStream) {
-      const vTrack = localStream.getVideoTracks()[0];
-      if (vTrack) {
-        await vTrack
-          .applyConstraints({
-            width: { exact: q.width },
-            height: { exact: q.height },
-            frameRate: { exact: q.frameRate },
-          })
-          .catch(() => {});
-      }
-    }
-
-    for (const pc of Object.values(peerConnections)) {
-      applyEncodingParams(quality, pc);
-    }
-  }
-
-  function applyZoom(val: number) {
-    if (nativeZoomSupported && localStream) {
-      const track = localStream.getVideoTracks()[0];
-      track
-        .applyConstraints({
-          advanced: [{ zoom: val } as MediaTrackConstraintSet],
-        })
-        .catch(() => {
-          preview.style.transform = `scale(${val})`;
-          nativeZoomSupported = false;
+    // @ts-expect-error Chrome-only API
+    if (navigator.getBattery) {
+      // @ts-expect-error Chrome-only API
+      navigator.getBattery().then((battery) => {
+        battery.addEventListener("levelchange", () => {
+          reportBattery(battery);
         });
-    } else {
-      preview.style.transform = `scale(${val})`;
-      nativeZoomSupported = false;
-    }
-
-    if (!nativeZoomSupported && localStream) {
-      const track = localStream.getVideoTracks()[0];
-      const settings = track.getSettings();
-      ws?.send(
-        `j:${JSON.stringify({
-          zoom: val,
-          rotate: (settings.width ?? 1920) < (settings.height ?? 1080),
-        })}`
-      );
+      });
     }
   }
 
-  let initialPinchDistance = $state(0);
-  let pinchStartZoom = $state(1);
-
-  // Manage DOM touch events safely
-  $effect(() => {
-    if (!preview) return;
-
-    const handleTouchStart = (e: TouchEvent) => {
-      if (e.touches.length === 2) {
-        initialPinchDistance = Math.hypot(
-          e.touches[0].clientX - e.touches[1].clientX,
-          e.touches[0].clientY - e.touches[1].clientY
-        );
-        pinchStartZoom = zoomValue;
-      }
-    };
-
-    const handleTouchMove = (e: TouchEvent) => {
-      if (e.touches.length !== 2) return;
-      const dist = Math.hypot(
-        e.touches[0].clientX - e.touches[1].clientX,
-        e.touches[0].clientY - e.touches[1].clientY
-      );
-      const scale = dist / initialPinchDistance;
-      const newZoom = Math.max(minZoom, Math.min(maxZoom, pinchStartZoom * scale));
-      applyZoom(newZoom);
-    };
-
-    preview.addEventListener('touchstart', handleTouchStart, { passive: true });
-    preview.addEventListener('touchmove', handleTouchMove, { passive: true });
-
-    return () => {
-      preview.removeEventListener('touchstart', handleTouchStart);
-      preview.removeEventListener('touchmove', handleTouchMove);
-    };
+  onDestroy(() => {
+    socket.finish();
+    isSocketOpen = false;
+    rtcManager.finish();
   });
 
-  async function acquireWakeLock() {
-    try {
-      wakeLock = await navigator.wakeLock.request('screen');
-      wakeLock.addEventListener('release', () => {
-        document.addEventListener('visibilitychange', reacquireWakeLock, { once: true });
-      });
-    } catch { /* empty */ }
-  }
-
-  async function reacquireWakeLock() {
-    if (document.visibilityState === 'visible') {
-      await acquireWakeLock();
+  async function commandHandler(command: ServerToClient) {
+    if (command.changeQuality && command.changeQuality.quality) {
+      sourceMedia.applyQuality(command.changeQuality.quality);
+      const msg = ClientToServer.create();
+      msg.changeQualityResponse = {
+        quality: command.changeQuality.quality,
+      };
+      socket.send(ClientToServer.encode(msg).finish());
     }
-  }
-
-  async function startCamera() {
-    try {
-      await acquireWakeLock();
-      const q = QUALITY_PROFILES[currentQuality];
-      localStream = await navigator.mediaDevices.getUserMedia({
-        video: {
-          aspectRatio: { exact: 16/9 },
-          facingMode: { ideal: facingMode },
-          width:     { exact: q.width },
-          height:    { exact: q.height },
-          frameRate: { exact: q.frameRate },
-        },
-        audio: {
-          echoCancellation: false,
-          noiseSuppression: false,
-          autoGainControl: false,
-        }
-      });
-
-      preview.srcObject = localStream;
-
-      const track = localStream.getVideoTracks()[0];
-      const caps = track.getCapabilities?.() || {};
-      
-      // @ts-expect-error chrome only feature
-      if (caps.zoom) {
-        nativeZoomSupported = true;
-        // @ts-expect-error chrome only feature
-        minZoom = caps.zoom.min;
-        // @ts-expect-error chrome only feature
-        maxZoom = caps.zoom.max;
-      }
-
-      // Ensure proper WebSocket protocol
-      const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      ws = new WebSocket(`${wsProtocol}//${window.location.host}/ws?role=streamer`);
-
-      ws.addEventListener("error", (err) => console.error("WebSocket Error:", err));
-      
-      ws.addEventListener("close", () => {
-        // window.location.reload();
-      });
-
-      ws.addEventListener("message", async (event) => {
-        let commandStr: string = event.data.toString();
-        const parts = commandStr.split(":");
-        const command = parts.shift();
-        const params = parts.join(":");
-        
-        switch (command) {
-          case "e": // Viewer requests offer
-            await createOffer(params);
-            break;
-            
-          case "h": { // Received ICE candidate from Viewer
-            const candidateString = params.split(":");
-            const viewerId = candidateString.shift();
-            if (!viewerId) return;
-            
-            const candidate = JSON.parse(candidateString.join(":").slice(1));
-            const pc = peerConnections[viewerId];
-            
-            if (pc && candidate) {
-              // QUEUE LOGIC: Only add if remote description is set
-              if (pc.remoteDescription && pc.remoteDescription.type) {
-                await pc.addIceCandidate(new RTCIceCandidate(candidate));
-              } else {
-                console.log(`Queueing ICE candidate for ${viewerId}`);
-                candidateQueues[viewerId].push(candidate);
-              }
-            }
-            break;
-          }
-
-          case "f": { // Received Answer from Viewer
-            const candidateString = params.split(":");
-            const viewerId = candidateString.shift();
-            if (!viewerId) return;
-
-            const sdp = JSON.parse(candidateString.join(":").slice(1));
-            const pc = peerConnections[viewerId];
-            console.log(`[SIGNALING] Got Answer. Looking for PC with ID: ${viewerId}. Did we find it?`, !!pc);
-
-            if (pc && pc.signalingState !== "stable") {
-              await pc.setRemoteDescription(new RTCSessionDescription(sdp));
-              
-              // QUEUE LOGIC: Flush the queue now that description is set
-              const queue = candidateQueues[viewerId] || [];
-              while (queue.length > 0) {
-                const queuedCandidate = queue.shift();
-                if (queuedCandidate) {
-                  await pc.addIceCandidate(new RTCIceCandidate(queuedCandidate));
-                }
-              }
-            }
-            break;
-          }
-          
-          case "i": // Apply quality change
-            await applyQuality(stringToQuality(params.split(":")[1]));
-            break;
-        }
-      });
-    } catch (err) {
-      console.error(err);
-      alert("Could not start camera");
+    if (command.changeZoom) {
+      if (isCamera) (sourceMedia as Camera).applyZoom(command.changeZoom.zoom);
+    }
+    if (command.disconnectPeer && command.disconnectPeer.session) {
+      rtcManager.closePeerConnection(command.disconnectPeer.session);
+    }
+    if (command.iceCandidate && command.iceCandidate.session) {
+      rtcManager.addICECandidate(
+        command.iceCandidate.session,
+        JSON.parse(command.iceCandidate.candidate),
+      );
+    }
+    if (command.requestRtcOffer && command.requestRtcOffer.session) {
+      await createOffer(command.requestRtcOffer.session);
+    }
+    if (command.rtcAnswer && command.rtcAnswer.session) {
+      rtcManager.setRemoteDescription(
+        command.rtcAnswer.session,
+        JSON.parse(command.rtcAnswer.answer),
+      );
     }
   }
 </script>
 
-<video id="preview" autoplay muted playsinline bind:this={preview}></video>
-<button id="start-btn" onclick={startCamera}>Start Camera</button>
+{#if !isSocketOpen}
+  <div class="selectionScreen">
+    <button
+      id="start-btn"
+      class="selectionButton clickable"
+      onclick={() => {
+        isSocketOpen = true;
+        isCamera = true;
+        init();
+      }}
+    >
+      <div class="buttonIcon camera"></div>
+      <span class="selectionTitle">Start Camera</span>
+    </button>
+    <button
+      id="start-btn"
+      class="selectionButton clickable"
+      onclick={() => {
+        isSocketOpen = true;
+        isCamera = false;
+        init();
+      }}
+    >
+      <div class="buttonIcon screen"></div>
+      <span class="selectionTitle">Start Screen Share</span>
+    </button>
+  </div>
+{:else}
+  <div class="overlay">
+    <button
+      class="fullscreenBtn clickable"
+      onclick={(e) => {
+        const state = toggleFullScreen();
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (e.target as any).classList.toggle("isFullscreen", state);
+      }}
+      aria-label="Tela Cheia"><div class="fullscreenIcon"></div></button
+    >
+    <img class="branding" alt="Company Logo" src="/logo.png" />
+  </div>
+  {#if isCamera}
+    <Camera
+      bind:this={sourceMedia}
+      onTransform={onCameraTransform}
+      {setStreamingBandwidth}
+    />
+  {:else}
+    <Screen
+      bind:this={sourceMedia}
+      {setStreamingBandwidth}
+      onTransform={onCameraTransform}
+    />
+  {/if}
+{/if}
 
 <style>
-  * {
-    padding: 0;
-    margin: 0;
-    box-sizing: border-box;
+  .selectionScreen {
+    display: grid;
+    grid-template-columns: 2fr 1fr;
+    grid-template-rows: 1fr;
+    width: 100%;
+    height: 100%;
+    justify-items: center;
+    align-items: center;
+    gap: 1rem;
+    padding: 1rem;
+
+    @media screen and (orientation: portrait) {
+      grid-template-rows: 2fr 1fr;
+      grid-template-columns: 1fr;
+    }
   }
 
-  video {
-    width: 100vw;
-    height: 100vh;
+  .selectionButton {
+    cursor: pointer;
+    border: 1px solid var(--accent-color);
+    background: hsla(from var(--accent-color) h s l / 0.3);
+    color: var(--accent-color);
+    font-size: 1.5rem;
+    padding: 1.5rem 0.75rem;
+    border-radius: 0.5rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    width: 100%;
+    height: 100%;
+  }
+
+  .buttonIcon {
+    height: 100%;
+    width: 100%;
+    background: var(--accent-color);
+    mask-size: contain;
+    mask-repeat: no-repeat;
+    mask-position: center center;
+    &.camera {
+      mask-image: url("/icons/camera.svg");
+    }
+    &.screen {
+      mask-image: url("/icons/screenshare.svg");
+    }
+  }
+
+  .selectionTitle {
+    font-size: 1.5rem;
+    font-weight: bolder;
+  }
+
+  .overlay {
     position: absolute;
-    top: 0;
-    left: 0;
-    object-fit: cover; /* Added to prevent stretching */
+    width: 100%;
+    height: 100%;
+    padding: 1rem;
+    display: flex;
+    flex-direction: row;
+    justify-content: space-between;
+    align-items: start;
+    z-index: 9999;
+    pointer-events: none;
   }
 
-  button {
-    position: fixed;
-    top: 20px;
-    left: 20px;
-    padding: 10px 20px;
-    z-index: 10;
+  .fullscreenBtn {
+    width: 3.5rem;
+    height: auto;
+    aspect-ratio: 1;
+    background: hsla(from var(--accent-color) h s l / 0.3);
+    border-radius: 0.5rem;
+    border: 1px solid var(--accent-color);
+    padding: 0.25rem;
+    cursor: pointer;
+    position: absolute;
+    top: 1rem;
+    left: 1rem;
+  }
+
+  .fullscreenIcon {
+    width: 100%;
+    height: 100%;
+    background: var(--accent-color);
+    mask-image: url("/icons/fullscreenicon.svg");
+    mask-size: contain;
+  }
+  .fullscreenIcon:global(.isFullscreen) {
+    mask-image: url("/icons/fullscreenexit.svg");
+  }
+
+  .clickable {
+    pointer-events: all;
+  }
+
+  .branding {
+    pointer-events: none;
+    opacity: 0.35;
+    width: 45dvw;
+    height: 45dvh;
+    object-fit: contain;
+    position: absolute;
+    bottom: 2rem;
+    right: 2rem;
   }
 </style>
